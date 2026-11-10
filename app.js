@@ -5,16 +5,23 @@ import {
   updateProfile, signOut,
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import {
-  collection, query, orderBy, limit, onSnapshot, addDoc, doc, updateDoc, deleteDoc,
-  serverTimestamp, arrayUnion, arrayRemove, increment, writeBatch,
+  collection, query, where, orderBy, onSnapshot, addDoc, doc, getDoc, getDocs, setDoc,
+  updateDoc, deleteDoc, serverTimestamp, arrayUnion, arrayRemove, increment, writeBatch,
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 const $app = document.getElementById("app");
 const MAX = 280;
 
 let user = null;
-let unsubPosts = null;
+let appToken = 0;
+let view = "feed";
+let unsubs = [];
 let posts = [];
+let myFriends = [];
+let incoming = [];
+let outgoing = [];
+const profiles = new Map();
+const adding = new Set();
 const openComments = new Set();
 const commentUnsubs = new Map();
 const commentsByPost = new Map();
@@ -39,7 +46,9 @@ const errMsg = e => ERR[e?.code] ?? "حصلت مشكلة، حاول تاني";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+const myUsername = () => (user?.email || "").split("@")[0];
 const displayName = u => u.displayName || (u.email ? u.email.split("@")[0] : "مستخدم");
+const avatar = name => `<div class="avatar">${esc((name || "?")[0])}</div>`;
 
 function ago(ts) {
   if (!ts) return "دلوقتي";
@@ -61,10 +70,13 @@ function toast(msg) {
 }
 
 function teardown() {
-  unsubPosts?.(); unsubPosts = null;
+  appToken++;
+  unsubs.forEach(u => u()); unsubs = [];
   commentUnsubs.forEach(u => u());
   commentUnsubs.clear(); commentsByPost.clear(); openComments.clear();
-  posts = [];
+  posts = []; myFriends = []; incoming = []; outgoing = [];
+  profiles.clear(); adding.clear();
+  view = "feed";
 }
 
 /* ---------- شاشة الإعداد (لو Firebase لسه متظبطش) ---------- */
@@ -72,7 +84,7 @@ function showSetup() {
   $app.innerHTML = `
     <div class="setup card">
       <h2 class="grad">Mindbook: باقي خطوة الإعداد</h2>
-      <p>افتح الملف <code>js/firebase.js</code> والصق إعدادات مشروعك من Firebase بدل القيم اللي شكلها <code>YOUR_...</code>.</p>
+      <p>افتح الملف <code>firebase.js</code> والصق إعدادات مشروعك من Firebase بدل القيم اللي شكلها <code>YOUR_...</code>.</p>
       <p>الخطوات كاملة في ملف <code>README.md</code>.</p>
     </div>`;
 }
@@ -132,27 +144,145 @@ function showAuth(mode = "login") {
   };
 }
 
+/* ---------- تجهيز بيانات المستخدم في قاعدة البيانات ---------- */
+async function ensureProfile(u) {
+  const name = displayName(u);
+  const uref = doc(db, "users", u.uid);
+  const fref = doc(db, "friendLists", u.uid);
+  const [us, fs] = await Promise.all([getDoc(uref), getDoc(fref)]);
+  if (!us.exists()) {
+    await setDoc(uref, { username: (u.email || "").split("@")[0], displayName: name, createdAt: serverTimestamp() });
+  } else if (us.data().displayName !== name) {
+    await updateDoc(uref, { displayName: name });
+  }
+  if (!fs.exists()) await setDoc(fref, { friends: [] });
+}
+
 /* ---------- التطبيق الرئيسي ---------- */
-function showApp() {
+async function showApp() {
   teardown();
+  const token = appToken;
   user = auth.currentUser;
   if (!user) return showAuth();
+  try { await ensureProfile(user); } catch (err) { toast(errMsg(err)); }
+  if (token !== appToken) return; // اتفتحت شاشة تانية في الأثناء
 
   $app.innerHTML = `
     <header>
       <div class="brand">${LOGO}<h1 class="grad">Mindbook</h1></div>
       <span class="who">${esc(displayName(user))} · <a href="#" id="logout">خروج</a></span>
     </header>
-    <main>
-      <div class="card">
-        <textarea id="postText" placeholder="إيه اللي في عقلك يا ${esc(displayName(user))}؟" maxlength="${MAX}"></textarea>
-        <div class="row">
-          <span class="count" id="count">0/${MAX}</span>
-          <button id="postBtn" disabled>نشر</button>
-        </div>
+    <nav class="tabs">
+      <button class="tab on" data-view="feed">الرئيسية</button>
+      <button class="tab" data-view="friends">الأصدقاء <span class="badge" id="badge" hidden></span></button>
+    </nav>
+    <main id="main"></main>`;
+
+  document.getElementById("logout").onclick = e => { e.preventDefault(); signOut(auth); };
+
+  document.querySelectorAll(".tab").forEach(t => {
+    t.onclick = () => {
+      view = t.dataset.view;
+      document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+      renderMain();
+    };
+  });
+
+  const main = document.getElementById("main");
+  main.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.act) onFeedClick(b);
+    else if (b.dataset.fact) onFriendAction(b);
+    else if (b.id === "addFriend") sendRequest(document.getElementById("friendName").value);
+  });
+  main.addEventListener("keydown", e => {
+    if (e.key !== "Enter") return;
+    if (e.target.matches("input[data-draft]")) sendComment(e.target.closest(".card"));
+    else if (e.target.id === "friendName") sendRequest(e.target.value);
+  });
+
+  startListeners();
+  renderMain();
+}
+
+function startListeners() {
+  const uid = user.uid;
+  const fail = err => toast(errMsg(err));
+
+  unsubs.push(onSnapshot(doc(db, "friendLists", uid), s => {
+    myFriends = s.data()?.friends ?? [];
+    loadProfiles(myFriends);
+    if (view === "feed") renderFeed(); else renderFriends();
+  }, fail));
+
+  // بنجيب بوستات اللي أنا في الـ audience بتاعها، وبنرتبها هنا عند الجهاز
+  unsubs.push(onSnapshot(query(collection(db, "posts"), where("audience", "array-contains", uid)), snap => {
+    const t = p => p.createdAt?.toMillis?.() ?? Number.MAX_SAFE_INTEGER;
+    posts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => t(b) - t(a));
+    if (view === "feed") renderFeed();
+  }, fail));
+
+  unsubs.push(onSnapshot(query(collection(db, "requests"), where("to", "==", uid)), snap => {
+    incoming = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    reconcile(); updateBadge();
+    if (view === "friends") renderFriends();
+  }, fail));
+
+  unsubs.push(onSnapshot(query(collection(db, "requests"), where("from", "==", uid)), snap => {
+    outgoing = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    reconcile();
+    if (view === "friends") renderFriends();
+  }, fail));
+}
+
+// لما حد يقبل طلبي، بضيفه في قائمة أصدقائي أنا كمان
+function reconcile() {
+  const want = [
+    ...outgoing.filter(r => r.status === "accepted").map(r => r.to),
+    ...incoming.filter(r => r.status === "accepted").map(r => r.from),
+  ];
+  want.forEach(f => {
+    if (myFriends.includes(f) || adding.has(f)) return;
+    adding.add(f);
+    updateDoc(doc(db, "friendLists", user.uid), { friends: arrayUnion(f) })
+      .catch(() => {})
+      .finally(() => adding.delete(f));
+  });
+}
+
+function updateBadge() {
+  const el = document.getElementById("badge");
+  if (!el) return;
+  const n = incoming.filter(r => r.status === "pending").length;
+  el.textContent = n;
+  el.hidden = n === 0;
+}
+
+async function loadProfiles(uids) {
+  const need = uids.filter(u => !profiles.has(u));
+  if (!need.length) return;
+  await Promise.all(need.map(async u => {
+    try {
+      const s = await getDoc(doc(db, "users", u));
+      profiles.set(u, s.exists() ? s.data() : { displayName: "مستخدم", username: "" });
+    } catch { profiles.set(u, { displayName: "مستخدم", username: "" }); }
+  }));
+  if (view === "friends") renderFriends();
+}
+
+function renderMain() {
+  if (view === "friends") { renderFriends(); return; }
+
+  document.getElementById("main").innerHTML = `
+    <div class="card">
+      <textarea id="postText" placeholder="إيه اللي في عقلك يا ${esc(displayName(user))}؟" maxlength="${MAX}"></textarea>
+      <div class="row">
+        <span class="count" id="count">0/${MAX}</span>
+        <button id="postBtn" disabled>نشر</button>
       </div>
-      <div id="feed"></div>
-    </main>`;
+    </div>
+    <div id="feed"></div>`;
 
   const ta = document.getElementById("postText");
   const btn = document.getElementById("postBtn");
@@ -168,6 +298,7 @@ function showApp() {
       await addDoc(collection(db, "posts"), {
         uid: user.uid, author: displayName(user), text,
         createdAt: serverTimestamp(), likes: [], commentCount: 0,
+        audience: [user.uid, ...myFriends], // أنا وأصدقائي وقت النشر
       });
       ta.value = "";
       document.getElementById("count").textContent = "0/" + MAX;
@@ -176,21 +307,10 @@ function showApp() {
       btn.disabled = false;
     }
   };
-  document.getElementById("logout").onclick = e => { e.preventDefault(); signOut(auth); };
-
-  const $feed = document.getElementById("feed");
-  $feed.addEventListener("click", onFeedClick);
-  $feed.addEventListener("keydown", e => {
-    if (e.key === "Enter" && e.target.matches("input[data-draft]")) sendComment(e.target.closest(".card"));
-  });
-
-  unsubPosts = onSnapshot(
-    query(collection(db, "posts"), orderBy("createdAt", "desc"), limit(50)),
-    snap => { posts = snap.docs.map(d => ({ id: d.id, ...d.data() })); renderFeed(); },
-    err => toast(errMsg(err)),
-  );
+  renderFeed();
 }
 
+/* ---------- الرئيسية ---------- */
 function renderFeed() {
   const $feed = document.getElementById("feed");
   if (!$feed) return;
@@ -201,20 +321,25 @@ function renderFeed() {
   const active = document.activeElement;
   const focusId = active?.matches?.("input[data-draft]") ? active.dataset.draft : null;
 
-  if (!posts.length) {
-    $feed.innerHTML = `<div class="empty">لسه مفيش أفكار. شارك أول واحدة!</div>`;
+  // بوستاتي وبوستات أصحابي بس
+  const visible = posts.filter(p => p.uid === user.uid || myFriends.includes(p.uid));
+
+  if (!visible.length) {
+    $feed.innerHTML = `<div class="empty">${myFriends.length
+      ? "لسه مفيش أفكار. شارك أول واحدة!"
+      : "لسه مفيش أفكار. شارك أول واحدة، وضيف أصدقاء من تبويب «الأصدقاء» عشان تشوف أفكارهم."}</div>`;
     return;
   }
 
-  $feed.innerHTML = posts.map(p => {
+  $feed.innerHTML = visible.map(p => {
     const likes = p.likes ?? [];
     const liked = likes.includes(user.uid);
     const open = openComments.has(p.id);
     const comments = commentsByPost.get(p.id) ?? [];
     return `
-    <div class="card" data-id="${p.id}">
+    <div class="card" data-id="${esc(p.id)}">
       <div class="meta">
-        <div class="avatar">${esc((p.author || "?")[0])}</div>
+        ${avatar(p.author)}
         <div><div class="name">${esc(p.author)}</div><div class="time">${ago(p.createdAt)}</div></div>
       </div>
       <div class="text">${esc(p.text)}</div>
@@ -228,10 +353,10 @@ function renderFeed() {
         ${comments.map(c => `
           <div class="comment">
             <span><b>${esc(c.author)}</b>${esc(c.text)}</span>
-            ${c.uid === user.uid ? `<button data-act="delComment" data-cid="${c.id}" title="حذف">✕</button>` : ""}
+            ${c.uid === user.uid ? `<button data-act="delComment" data-cid="${esc(c.id)}" title="حذف">✕</button>` : ""}
           </div>`).join("")}
         <div class="row">
-          <input type="text" placeholder="اكتب تعليق..." maxlength="140" data-draft="${p.id}">
+          <input type="text" placeholder="اكتب تعليق..." maxlength="140" data-draft="${esc(p.id)}">
           <button data-act="addComment">إرسال</button>
         </div>
       </div>` : ""}
@@ -245,10 +370,7 @@ function renderFeed() {
   }
 }
 
-/* ---------- التفاعلات ---------- */
-async function onFeedClick(e) {
-  const b = e.target.closest("button[data-act]");
-  if (!b) return;
+async function onFeedClick(b) {
   const card = b.closest(".card");
   const id = card.dataset.id;
   const ref = doc(db, "posts", id);
@@ -290,7 +412,7 @@ function toggleComments(id) {
   const q = query(collection(db, "posts", id, "comments"), orderBy("createdAt", "asc"));
   commentUnsubs.set(id, onSnapshot(q, snap => {
     commentsByPost.set(id, snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    renderFeed();
+    if (view === "feed") renderFeed();
   }, err => toast(errMsg(err))));
   renderFeed();
 }
@@ -315,6 +437,117 @@ async function sendComment(card) {
     await batch.commit();
   } catch (err) {
     input.value = text;
+    toast(errMsg(err));
+  }
+}
+
+/* ---------- الأصدقاء ---------- */
+function renderFriends() {
+  const main = document.getElementById("main");
+  if (!main || view !== "friends") return;
+
+  const kept = document.getElementById("friendName")?.value ?? "";
+  const hadFocus = document.activeElement?.id === "friendName";
+  const inPending = incoming.filter(r => r.status === "pending");
+  const outPending = outgoing.filter(r => r.status === "pending");
+
+  const item = (name, sub, buttons) => `
+    <div class="item">
+      ${avatar(name)}
+      <div class="grow"><div class="name">${esc(name)}</div><div class="time">${sub ? "@" + esc(sub) : ""}</div></div>
+      ${buttons}
+    </div>`;
+
+  main.innerHTML = `
+    <div class="card">
+      <h3>إضافة صديق</h3>
+      <div class="row">
+        <input type="text" id="friendName" dir="ltr" placeholder="اسم المستخدم" maxlength="20"
+               autocapitalize="none" autocorrect="off">
+        <button id="addFriend">إرسال طلب</button>
+      </div>
+    </div>
+
+    ${inPending.length ? `<div class="card"><h3>طلبات واردة</h3>
+      ${inPending.map(r => item(r.fromName, r.fromUsername,
+        `<button data-fact="accept" data-id="${esc(r.id)}">قبول</button>
+         <button class="ghost" data-fact="decline" data-id="${esc(r.id)}">رفض</button>`)).join("")}
+    </div>` : ""}
+
+    ${outPending.length ? `<div class="card"><h3>طلبات مرسلة</h3>
+      ${outPending.map(r => item(r.toName, r.toUsername,
+        `<button class="ghost" data-fact="cancel" data-id="${esc(r.id)}">إلغاء</button>`)).join("")}
+    </div>` : ""}
+
+    <div class="card"><h3>أصدقائي (${myFriends.length})</h3>
+      ${myFriends.length ? myFriends.map(f => {
+        const p = profiles.get(f);
+        return item(p?.displayName ?? "...", p?.username ?? "",
+          `<button class="ghost del" data-fact="unfriend" data-id="${esc(f)}">حذف</button>`);
+      }).join("") : `<div class="empty small">لسه معندكش أصدقاء. ابعت طلب باسم المستخدم.</div>`}
+    </div>`;
+
+  const input = document.getElementById("friendName");
+  input.value = kept;
+  if (hadFocus) { input.focus(); input.setSelectionRange(kept.length, kept.length); }
+}
+
+async function sendRequest(raw) {
+  const uname = (raw || "").trim().toLowerCase().replace(/^@/, "");
+  if (!USERNAME_RE.test(uname)) return toast("اكتب اسم مستخدم صحيح (إنجليزي وأرقام)");
+  try {
+    const snap = await getDocs(query(collection(db, "users"), where("username", "==", uname)));
+    if (snap.empty) return toast("مفيش مستخدم بالاسم ده");
+    const other = snap.docs[0];
+    const oid = other.id;
+    if (oid === user.uid) return toast("ده حسابك إنت 😄");
+    if (myFriends.includes(oid)) return toast("هو صديقك بالفعل");
+    if (incoming.some(r => r.from === oid && r.status === "pending"))
+      return toast("هو باعتلك طلب، اقبله من الطلبات الواردة");
+    if (outgoing.some(r => r.to === oid)) return toast("الطلب اتبعت قبل كده");
+
+    await setDoc(doc(db, "requests", `${user.uid}_${oid}`), {
+      from: user.uid, to: oid,
+      fromName: displayName(user), fromUsername: myUsername(),
+      toName: other.data().displayName, toUsername: uname,
+      status: "pending", createdAt: serverTimestamp(),
+    });
+    const input = document.getElementById("friendName");
+    if (input) input.value = "";
+    toast("اتبعت الطلب ✅");
+  } catch (err) {
+    toast(errMsg(err));
+  }
+}
+
+async function onFriendAction(b) {
+  const id = b.dataset.id;
+  try {
+    switch (b.dataset.fact) {
+      case "accept": {
+        const r = incoming.find(x => x.id === id);
+        if (!r) return;
+        const batch = writeBatch(db);
+        batch.update(doc(db, "requests", id), { status: "accepted" });
+        batch.update(doc(db, "friendLists", user.uid), { friends: arrayUnion(r.from) });
+        await batch.commit();
+        toast("بقيتوا أصدقاء 🎉");
+        break;
+      }
+      case "decline":
+      case "cancel":
+        await deleteDoc(doc(db, "requests", id));
+        break;
+      case "unfriend": {
+        if (!confirm("تحذف الصديق ده؟")) return;
+        // نمسح الطلبات الأول (لو لسه موجودة)، وبعدين نشيله من القائمة
+        const mine = [...incoming, ...outgoing].filter(r => r.from === id || r.to === id);
+        for (const r of mine) await deleteDoc(doc(db, "requests", r.id));
+        await updateDoc(doc(db, "friendLists", user.uid), { friends: arrayRemove(id) });
+        break;
+      }
+    }
+  } catch (err) {
     toast(errMsg(err));
   }
 }
